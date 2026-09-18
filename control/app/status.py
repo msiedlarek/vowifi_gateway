@@ -47,6 +47,8 @@ REASONS = {
     "registering": "VoWiFi tunnel is up — registering to the carrier's IMS…",
     "reg_rejected": "Can't register to the carrier's IMS (authentication or provisioning issue).",
     "ok": "Working — connected to the carrier over Wi-Fi.",
+    "no_engine": "The line is set to run, but no engine container is serving it (static mode: "
+                 "start the container for this line by hand).",
 }
 
 
@@ -100,6 +102,10 @@ async def compute(inst: dict, ami_client=None) -> dict:
                 "reason_code": code, "reason": REASONS.get(code, ""), "detail": detail}
 
     if not inst.get("enabled", True) or not engine.is_running(iid):
+        if engine.waiting_for_container(iid):
+            return {"state": "STOPPED", "label": "No engine container",
+                    "reason_code": "no_engine", "reason": REASONS["no_engine"],
+                    "detail": detail}
         return {"state": "STOPPED", "label": LABELS["STOPPED"],
                 "reason_code": "stopped", "reason": "Stopped.", "detail": detail}
 

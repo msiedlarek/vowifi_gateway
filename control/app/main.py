@@ -77,11 +77,11 @@ class Hub:
 
     async def drop_ami(self, iid: str):
         """Tear down and forget the AMI client for an instance. MUST be called whenever the
-        engine container is stopped or recreated (stop/start/reprovision): the client's
-        panoramisk Manager auto-reconnects forever, so a client left pointing at a removed or
-        recreated container keeps dialing it — and if the new container has a different AMI
-        secret (or the docker IP was reused by another line) it floods that Asterisk with
-        'failed to authenticate' every few seconds. close() sets the client's closed flag which
+        engine session is stopped or restarted (stop/start/reprovision): the client's
+        panoramisk Manager auto-reconnects forever, so a client left pointing at a stopped or
+        restarted engine keeps dialing it — and if the new session has a different AMI secret
+        (or the address was reused by another line) it floods that Asterisk with 'failed to
+        authenticate' every few seconds. close() sets the client's closed flag which
         neutralises the pending reconnect."""
         c = self.ami.pop(str(iid), None)
         if c:
@@ -102,7 +102,7 @@ class Hub:
         # Serialise per-instance so concurrent callers (the 4s status_poller + API handlers) can't
         # each build a client and orphan the other's: an orphaned AmiClient is never close()d, so
         # its panoramisk Manager reconnects forever (flooding the engine's Asterisk with AMI auth
-        # failures once a container reuses its docker IP).
+        # failures once a session starts with a new secret).
         lock = self._ami_locks.setdefault(iid, asyncio.Lock())
         async with lock:
             inst = cfg.get_instance(iid)
@@ -246,7 +246,7 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
         # running instance" could stop a healthy line on ANOTHER reader.
         target = await asyncio.to_thread(_find_running_by_reader, name)
     if target and await asyncio.to_thread(engine.is_running, str(target["id"])):
-        # Stop the SIP server + docker container on card/reader removal.
+        # Stop the SIP server + engine session on card/reader removal.
         await asyncio.to_thread(engine.stop, str(target["id"]))
         await hub.drop_ami(str(target["id"]))
         await hub.broadcast({"type": "engine", "instance": target["id"],
@@ -369,8 +369,11 @@ async def learn_msisdn(iid):
     """One-shot: enable the SIP logger, re-register to produce a fresh 200 OK, then parse
     the P-Associated-URI. Capped attempts so we don't re-register forever."""
     try:
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip set logger on")
-        await asyncio.to_thread(engine.exec_cli, iid, "pjsip send register volte_ims")
+        ami = await hub.ami_for(iid)
+        if ami is None:
+            return
+        await ami.command("pjsip set logger on")
+        await ami.command("pjsip send register volte_ims")
         await asyncio.sleep(8)
         msisdn = await asyncio.to_thread(extract_msisdn, iid)
         if msisdn:
@@ -1044,8 +1047,8 @@ async def api_provision(body: dict):
         ) from e
     hub._msisdn_tries.pop(str(inst["id"]), None)
     hub.reset_health(inst["id"])
-    # engine.start force-removes any existing container; retire AMI first so a cached
-    # client can't keep Login'ing the old (or IP-reused) engine with a stale secret.
+    # engine.start restarts the engine session; retire AMI first so a cached client can't
+    # keep Login'ing the old (or address-reused) engine with a stale secret.
     await hub.drop_ami(str(inst["id"]))
     await asyncio.to_thread(engine.start, inst, cfg.get_settings(),
                             dev_mounts=os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1")
@@ -1139,6 +1142,7 @@ async def api_instance_upsert(body: dict):
 async def api_instance_delete(iid: str):
     await asyncio.to_thread(engine.stop, iid)
     await hub.drop_ami(iid)
+    await asyncio.to_thread(engine.remove, iid)
     cfg.delete_instance(iid)
     _refresh_card_matches()
     await hub.broadcast({"type": "cards", "cards": hub.cards_list()})
@@ -1207,7 +1211,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
         inst = cfg.upsert_instance({"id": str(iid), **updates})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
-    await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
+    await hub.drop_ami(iid)      # engine.start restarts the session (maybe new secret) -> stale client
     cid = await asyncio.to_thread(engine.start, inst, settings, dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
     return {"ok": True, "container": cid}
@@ -1233,7 +1237,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
         raise HTTPException(409, {"code": pf["code"], "tries": pf.get("tries")})
     hub._msisdn_tries.pop(str(iid), None)
     hub.reset_health(iid)
-    await hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
+    await hub.drop_ami(iid)      # engine.start restarts the session (maybe new secret) -> stale client
     dev = os.environ.get("VOWIFI_DEV_MOUNTS", "") == "1"
     cid = await asyncio.to_thread(engine.start, inst, cfg.get_settings(), dev_mounts=dev)
     asyncio.create_task(push_status(str(iid)))
@@ -1259,7 +1263,7 @@ async def api_clear_pin(iid: str):
 async def api_instance_stop(iid: str):
     await asyncio.to_thread(engine.stop, iid)
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
-    # now-removed container (and floods a container that later reuses the docker IP).
+    # stopped engine (and floods a session that later starts with a new secret).
     await hub.drop_ami(iid)
     return {"ok": True}
 
@@ -1291,7 +1295,13 @@ def _read_run_text(iid, name, tail):
 
 @app.post("/api/instances/{iid}/register")
 async def api_instance_register(iid: str):
-    return {"output": engine.exec_cli(iid, "pjsip send register volte_ims")}
+    ami = await hub.ami_for(iid)
+    if not ami:
+        raise HTTPException(409, "Line is not running / control channel unavailable.")
+    try:
+        return {"output": await ami.command("pjsip send register volte_ims")}
+    except Exception as e:  # noqa
+        return {"output": f"error: {e}"}
 
 
 # ----------------------------- SMS -----------------------------

@@ -98,6 +98,15 @@ class AmiClient:
     def connected(self):
         return self._connected and self._mgr is not None and not self._closed
 
+    async def command(self, command: str) -> str:
+        """Run an Asterisk CLI command (like `asterisk -rx`) and return its output. Raises on
+        a lost connection or a timed-out action."""
+        if not self.connected:
+            raise ConnectionError("AMI not connected")
+        res = await self._action({"Action": "Command", "Command": command})
+        return "".join(str(m.get("Output") or m.get("content") or "")
+                       for m in (res if isinstance(res, list) else [res]))
+
     async def registration_state(self) -> str:
         """Return 'Registered' | 'Rejected' | 'Unregistered' | 'unknown'."""
         if not self.connected:
@@ -112,11 +121,7 @@ class AmiClient:
             log.debug("reg state error: %r", e)
         # Fallback: CLI
         try:
-            res = await self._action(
-                {"Action": "Command", "Command": "pjsip show registrations"})
-            text = ""
-            for m in (res if isinstance(res, list) else [res]):
-                text += str(m.get("Output") or m.get("content") or "")
+            text = await self.command("pjsip show registrations")
             if "Registered" in text:
                 return "Registered"
             if "Rejected" in text:

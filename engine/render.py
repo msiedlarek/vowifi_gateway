@@ -311,7 +311,7 @@ def main():
         f.write(f"USIM_ICCID={cfg.get('iccid','')}\n")
         f.write(f"VOWIFI_ID={ctx['id']}\n")
         f.write(f"MANAGER_URL={ctx['manager_url']}\n")
-        # SWu (python IKEv2/IPsec) launch params — consumed by entrypoint.sh to start
+        # SWu (python IKEv2/IPsec) launch params — consumed by session.sh to start
         # swu_ike.py. Reader is addressed by index for swu_ike's smartcard path; source is the
         # container IP; ePDG FQDN is resolved by swu_ike.
         f.write(f"USIM_READER_INDEX={cfg.get('reader_index', 0)}\n")

@@ -7,7 +7,9 @@
 # Runtime model: runs PRIVILEGED with the host Docker socket (/var/run/docker.sock) and the
 # host pcscd socket (/run/pcscd) bind-mounted; it launches/《manages》sibling engine containers
 # via the Docker SDK and reads the physical reader via pyscard. The repo layout is mirrored
-# under /app so run.py (`from app import ...`) resolves.
+# under /app so run.py (`from app import ...`) resolves. In static mode
+# (VOWIFI_ENGINE_BACKEND=static, see README) the engines are started by hand instead and the
+# Docker socket is not needed.
 
 # ---------- stage 1: build the WebUI ----------
 FROM node:22-alpine AS webui

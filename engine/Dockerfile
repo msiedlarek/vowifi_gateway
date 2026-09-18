@@ -4,7 +4,9 @@
 #                     — the ONLY tunnel path; verifies the SIM PIN in EAP-AKA, userspace ESP
 #   - pin_keeper.py : holds SIM PIN (CHV1) verified so IKE EAP-AKA + SIP IMS-AKA work on PIN-enabled SIMs
 #   - ami_usim.py   : reference USIM<->AMI bridge, patched to VERIFY PIN + report status
-#   - render.py     : renders /config/instance.json -> Asterisk configs at container start
+#   - render.py     : renders /config/instance.json -> Asterisk configs at session start
+#   - supervisor.py : PID 1; runs session.sh (the above) whenever the control plane asks for
+#                     the line to be up, driven by files in the mounted /instance directory
 #
 # Reproducibility: all build inputs are pinned so a from-scratch build on any machine/arch
 # (amd64/arm64) is functionally identical — the base image tag below, sysmocom asterisk
@@ -78,8 +80,9 @@ COPY ami_usim.py     /usr/local/bin/ami_usim.py
 COPY swu_ike.py      /usr/local/bin/swu_ike.py
 COPY render.py       /usr/local/bin/render.py
 COPY notify.py       /usr/local/bin/notify.py
+COPY supervisor.py   /usr/local/bin/supervisor.py
+COPY session.sh      /usr/local/bin/session.sh
 COPY templates/      /opt/vowifi/templates/
-COPY entrypoint.sh   /entrypoint.sh
-RUN chmod +x /usr/local/bin/*.py /entrypoint.sh
+RUN chmod +x /usr/local/bin/*.py /usr/local/bin/session.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python3", "-u", "/usr/local/bin/supervisor.py"]

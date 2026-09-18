@@ -37,7 +37,7 @@ The control-plane WebUI — dashboard, browser softphone, SMS messaging, and eSI
 
 The gateway has two planes:
 
-1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, runs an initiator-side liveness/DPD check to detect a silently-dead ePDG, re-syncs the P-CSCF into PJSIP on reconnect, advertises IKEv2 fragmentation (RFC 7383) and reassembles fragmented ePDG responses (fragmenting its own oversized messages too), classifies reject Notifies per 3GPP TS 24.302 §7.2.2.2 (honouring an attached back-off timer instead of hammering the network), answers the ePDG's IKEv2 `DEVICE_IDENTITY`/DPD/P-CSCF-restoration requests, and records every received 3GPP Notify — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
+1. **`vowifi/engine`** (per-SIM, always a Docker container): a pure-Python SWu IKEv2/IPsec client (`swu_ike.py`, based on [fasferraz/SWu-IKEv2](https://github.com/fasferraz/SWu-IKEv2)) for the ePDG tunnel (IKEv2 + EAP-AKA, userspace ESP) + sysmocom Asterisk (IMS PJSIP) + USIM bridge scripts (PIN keeper, AMI ↔ PC/SC). One container per SIM, each with `NET_ADMIN` + `/dev/net/tun` + its own port block (5060+, 10000+ RTP). The container is long-lived: its PID 1 (`supervisor.py`) starts, restarts and stops the engine *session* (PIN keeper, tunnel, Asterisk) on the control plane's request, passed through files in the line's `data/instances/<id>` directory, so a stop or re-provision does not recreate the container. (Engine containers created by earlier versions, which mounted `instance.json` as a single file, are recreated once on their next start.) The tunnel client carries VoWiFi resilience: it verifies the SIM PIN (CHV1) in its own PC/SC connection on every EAP-AKA authentication, sends NAT-T keepalives to hold the tunnel open when idle, runs an initiator-side liveness/DPD check to detect a silently-dead ePDG, re-syncs the P-CSCF into PJSIP on reconnect, advertises IKEv2 fragmentation (RFC 7383) and reassembles fragmented ePDG responses (fragmenting its own oversized messages too), classifies reject Notifies per 3GPP TS 24.302 §7.2.2.2 (honouring an attached back-off timer instead of hammering the network), answers the ePDG's IKEv2 `DEVICE_IDENTITY`/DPD/P-CSCF-restoration requests, and records every received 3GPP Notify — so it rekeys/re-auths and self-heals after a full re-establishment (see [Troubleshooting](#troubleshooting)).
 2. **control plane** (singleton): FastAPI manager + React WebUI dashboard. Manages engine containers via the Docker SDK and reads the SIM via pyscard over the host pcscd socket.
 
 The control plane runs in one of two **deploy modes** (chosen at install time):
@@ -45,7 +45,9 @@ The control plane runs in one of two **deploy modes** (chosen at install time):
 - **`local`** *(default)* — the control plane runs **natively on the host** as a Python venv + a `vowifi-control` systemd service; Docker is used **only as the engine layer**. The WebUI is still compiled with a throwaway `node:22-alpine` container, so the host needs no Node/JS toolchain.
 - **`docker`** — the control plane runs in a **privileged container** (host Docker socket + host pcscd socket bind-mounted), alongside the engine containers.
 
-In **both** modes the reader is owned by the **host's pcscd**, and **pcsc-lite is version-locked** (`PCSC_VERSION`, default 2.3.3) across the host + every container image so the PC/SC client/server protocol always matches. Runtime data (`config.yaml`, per-instance configs, SQLite call logs, TLS certs) lives in `./data`.
+There is also a **static mode** for environments without a Docker socket (Kubernetes, Compose, hand-run containers): the control plane does everything above except managing containers — you start one engine container per line yourself, and the two sides coordinate through the shared data directory. See [Static mode](#static-mode).
+
+In **all** modes the reader is owned by the **host's pcscd**, and **pcsc-lite is version-locked** (`PCSC_VERSION`, default 2.3.3) across the host + every container image so the PC/SC client/server protocol always matches. Runtime data (`config.yaml`, per-instance configs, SQLite call logs, TLS certs) lives in `./data`.
 
 ---
 
@@ -88,6 +90,8 @@ Set via **env vars** (or a `.env` file next to `install.sh`) before running `ins
 | `VOWIFI_ADVERTISE_ADDR` | auto-detect | Host LAN IP advertised to local SIP/WebRTC clients for RTP, Contact and SDP. It overrides **Settings → SIP / WebRTC advertise address**. Auto-detection prefers a real LAN NIC and skips common VPN/docker interfaces; pin it explicitly on multi-homed hosts. |
 | `VOWIFI_BIND` | `0.0.0.0` | Bind address for the control plane (rarely changed) |
 | `PCSC_VERSION` | `2.3.3` | pcsc-lite version pinned across host + all images |
+| `VOWIFI_ENGINE_BACKEND` | (Docker) | `static` = never manage containers; see [Static mode](#static-mode) |
+| `VOWIFI_STATIC_ENGINES` | `vowifi-engine-<id>` per line | Static mode only: `<id>=<host>,...` — the AMI host of each line's engine container |
 
 Example:
 ```bash
@@ -178,14 +182,51 @@ sudo ./install.sh patchall     # both — only for SIMs whose ATR the stock driv
 
 ## Per-instance ports
 
-Each provisioned SIM gets a port block (no collisions across SIMs). Instance index `i` (first SIM = 1):
-- SIP UDP: `5060 + 100*(i-1)`  
-- SIP TLS: `5061 + 100*(i-1)`  
-- WebRTC/WSS: `8089 + 100*(i-1)`  
-- AMI: `5038 + 100*(i-1)` (Asterisk manager for advanced users; set credentials in the dashboard)
-- RTP: `10000 + 100*(i-1)` through `+59` (60-port range per instance)
+Each provisioned SIM gets a port block (no collisions across SIMs). Blocks are numbered `i` from 0; a new line takes the lowest block that no other line holds and no host listener occupies:
+- SIP UDP: `5060 + 10*i`  
+- SIP TLS: `5061 + 10*i`  
+- WebRTC/WSS: `8089 + 10*i`  
+- AMI: `5038 + 10*i` (Asterisk manager for advanced users; set credentials in the dashboard)
+- RTP: `10000 + 2000*i` through `+59` (60-port range per instance)
 
-Example: the **first** SIM is on 5060/5061/8089, the **second** on 5160/5161/8189, etc.
+Example: the **first** SIM is on 5060/5061/8089 with RTP 10000–10059, the **second** on 5070/5071/8099 with RTP 12000–12059, etc. The dashboard's **SIP info** shows the block a line actually holds; a line can also be given a custom SIP port when it is provisioned.
+
+---
+
+## Static mode
+
+Static mode is for hosting where the control plane has no Docker socket — Kubernetes, Compose, or containers you run by hand. The control plane keeps everything it does (provisioning, WebUI, SMS, logs, eSIM, retries, stop-on-card-removal) except creating and removing engine containers: **you start one engine container per line** and keep it running. Start/stop/re-provision from the dashboard still work — they go through files in the line's instance directory, which the engine container mounts.
+
+**Control plane:** the `vowifi/control` image (or `python control/run.py` on a host) with
+
+- `VOWIFI_ENGINE_BACKEND=static`
+- the data directory mounted at `/data` (`VOWIFI_DATA=/data`) — shared with every engine container
+- `/run/pcscd` from the host
+- `VOWIFI_ADVERTISE_ADDR=<address SIP/WebRTC clients reach the engines on>` (the host/node IP where the engine ports are published)
+- `VOWIFI_MANAGER_URL=https://<address engines reach the control plane on>:8443` (e.g. a Compose service name or a Kubernetes Service)
+- `VOWIFI_STATIC_ENGINES=1=<host>,2=<host>` if the engines' AMI hosts are not `vowifi-engine-<id>` (Compose/Kubernetes names resolve as-is; AMI is on port 5038 inside the container)
+
+No `--privileged` and no Docker socket.
+
+**Engine container for line `<id>`** (lines are numbered 1, 2, … in provisioning order):
+
+```bash
+docker run -d --name vowifi-engine-1 --restart unless-stopped \
+  -v "$DATA/instances/1":/instance \
+  -v /run/pcscd:/run/pcscd \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -p 5060:5060/udp -p 5061:5061 -p 8089:8089 -p 10000-10059:10000-10059/udp \
+  vowifi/engine
+```
+
+- This is the same container the control plane would create in Docker mode: `supervisor.py` is PID 1, waits for the control plane's start request, runs the engine session, and restarts or ends it on request — the container itself never exits. Start it before or after provisioning the line; until the line is provisioned it just idles.
+- Mount the **whole** `instances/<id>` directory (`instance.json`, `run/`, `logs/`, `tls/`), not the files inside it — the control plane rewrites them and the container must see the new versions.
+- Publish the line's port block ([Per-instance ports](#per-instance-ports)) one-to-one: `5060/udp`, `5061`, `8089` and the 60 RTP ports map to the same numbers on the host (RTP ports are carried inside SDP, so they cannot be remapped). Lines provisioned in order get the nominal blocks, so the ports can be declared up front; the dashboard's **SIP info** shows the block each line holds. 5038 (AMI) only needs to be reachable by the control plane, not published.
+- Each engine needs its own network namespace: don't use host networking, and don't put two engines (or an engine and the control plane) in one namespace — the tunnel takes over the namespace's routing.
+- The TLS certificate for the engine's SIP-TLS/WSS listeners is copied into `instances/<id>/tls/` on every start (the Settings → TLS pair, else the control plane's self-signed one), so nothing extra to mount.
+- The host still runs pcscd at the pinned `PCSC_VERSION` (`install.sh` does that as part of `install`; on a Kubernetes node do the same by hand).
+
+The protocol between the two sides is documented at the top of `engine/supervisor.py` and `control/app/engine_static.py`.
 
 ---
 
@@ -343,7 +384,7 @@ Check its logs with `./install.sh logs` (that's `journalctl -u vowifi-control` i
 
 ## Development
 
-**Local mode already IS the dev-friendly path**: the control plane runs natively from `control/`, so editing `control/app/*.py` + `sudo ./install.sh restart` reloads it. To live-edit **engine** scripts without rebuilding the image, start the control plane with `VOWIFI_DEV_MOUNTS=1` set — the manager then bind-mounts the local `engine/*.py` + templates into each engine container as read-only overlays, so an edit + `docker restart vowifi-engine-<id>` applies immediately.
+**Local mode already IS the dev-friendly path**: the control plane runs natively from `control/`, so editing `control/app/*.py` + `sudo ./install.sh restart` reloads it. To live-edit **engine** scripts without rebuilding the image, start the control plane with `VOWIFI_DEV_MOUNTS=1` set — the manager then bind-mounts the local `engine/*.py` + templates into each engine container as read-only overlays, so an edit + `docker restart vowifi-engine-<id>` (or **Re-provision** in the dashboard, which restarts just the session) applies immediately.
 
 **Control-plane only, by hand** (outside the installer): create a venv, `pip install -r control/requirements.txt`, `export VOWIFI_DATA=./data`, `python control/run.py`. The WebUI dev server (`cd webui && npm run dev`) proxies `/api` + `/ws` to the control plane — point it with `VOWIFI_DEV_API=https://<gateway-host>:8443` (defaults to `localhost:8443`).
 
@@ -364,7 +405,7 @@ TUNNEL_DOWN → (IKEv2 EAP-AKA succeeds) →
 REGISTERING → (IMS REGISTER 200 OK) →
 OK
 ```
-`STOPPED` = user-initiated stop. Each transition logs to the engine's `/logs/<id>/entrypoint.log` and posts an event to the control plane (state + timestamp in the dashboard). The control plane also polls engine status files (`/run/<id>/status`, bind-mounted from the data dir).
+`STOPPED` = user-initiated stop. Each transition is logged on the engine's console (`docker logs`, also kept in `data/instances/<id>/logs/console.log`) and posted as an event to the control plane (state + timestamp in the dashboard). The control plane also polls the engine's status files in `data/instances/<id>/run/`.
 
 ---
 

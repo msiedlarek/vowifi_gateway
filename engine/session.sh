@@ -1,7 +1,8 @@
 #!/bin/bash
-# Engine entrypoint: render config -> hold PIN -> bring up the ePDG (SWu) tunnel with the
+# Engine session: render config -> hold PIN -> bring up the ePDG (SWu) tunnel with the
 # pure-Python IKEv2/IPsec implementation (swu_ike.py) -> discover P-CSCF -> start Asterisk
-# (IMS registration + voice/SMS).
+# (IMS registration + voice/SMS). Started by supervisor.py (the container's PID 1) whenever
+# the control plane asks for the line to be up, and killed by it as a process group on stop.
 #
 # SWu tunnel: swu_ike.py (fasferraz/SWu-IKEv2, patched) is the sole ePDG tunnel path. It does
 # IKEv2 + EAP-AKA (verifying the SIM PIN in its own PC/SC connection), userspace ESP over a
@@ -17,7 +18,7 @@ set -u
 export VOWIFI_RUNDIR="${VOWIFI_RUNDIR:-/run/vowifi}"
 mkdir -p "$VOWIFI_RUNDIR" /logs /etc/asterisk
 
-log() { echo "[entrypoint] $*"; }
+log() { echo "[session] $*"; }
 
 # --- 1. Render configs from /config/instance.json --------------------------------
 log "rendering configs..."

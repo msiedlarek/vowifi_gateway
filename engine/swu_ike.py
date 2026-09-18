@@ -13,6 +13,7 @@ import multiprocessing
 import requests
 import hashlib
 import ipaddress
+import urllib.parse
 
 from optparse import OptionParser
 from binascii import hexlify, unhexlify
@@ -2319,6 +2320,23 @@ class swu():
         # DESTINATION: pin each resolver nameserver (and they're LAN/RFC1918 anyway) to the LAN gw.
         for _ns in self._resolver_nameservers_v4():
             self.exec_in_netns("route add " + _ns + "/32 gw " + gw + " 2>/dev/null")
+        # The manager callback (notify.py -> MANAGER_URL) is container-originated too. On the
+        # docker bridge its host is the gateway itself (host.docker.internal), but in static
+        # mode it is typically a Compose/Kubernetes service address behind the default route:
+        # pin it the same way.
+        for _addr in self._manager_addresses_v4():
+            if _addr != gw:
+                self.exec_in_netns("route add " + _addr + "/32 gw " + gw + " 2>/dev/null")
+
+    def _manager_addresses_v4(self):
+        """IPv4 addresses of the MANAGER_URL host; [] when unset, an IPv6 literal or unresolvable."""
+        host = urllib.parse.urlsplit(os.environ.get("MANAGER_URL", "")).hostname
+        if not host:
+            return []
+        try:
+            return sorted({ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET)})
+        except socket.gaierror:
+            return []
 
     def _lan_egress_iface(self):
         """The container's outbound LAN interface (the one carrying SWU_SOURCE). Almost always eth0
