@@ -193,11 +193,38 @@ Example: the **first** SIM is on 5060/5061/8089 with RTP 10000–10059, the **se
 
 ---
 
+## Pre-built images
+
+The `images` GitHub workflow (`.github/workflows/images.yml`) builds both images for `linux/amd64` and `linux/arm64` and publishes them to the GitHub Container Registry under the account the repository lives in:
+
+- `ghcr.io/<owner>/vowifi-engine`
+- `ghcr.io/<owner>/vowifi-control`
+
+where `<owner>` is `pagecat` for this repository and your own account for a fork (the workflow derives it from the repository, so a fork publishes its own images without changes). Tags: `latest` (default branch), `<branch>`, `sha-<commit>`, and `<version>` / `<major>.<minor>` for `v*` release tags. The default branch is rebuilt from scratch every Monday so the base image's security updates get in; pull requests only build.
+
+Each image carries the pcsc-lite version it was built with as a label, which must match the host's pcscd (`install.sh` pins the same `PCSC_VERSION`):
+
+```bash
+docker inspect -f '{{ index .Config.Labels "vowifi.pcsc_version" }}' ghcr.io/pagecat/vowifi-engine:latest
+```
+
+`install.sh` still builds locally by default. To use the published engine image with it, tag it under the local name before installing — the installer reuses an existing `vowifi/engine`:
+
+```bash
+docker pull ghcr.io/pagecat/vowifi-engine:latest
+docker tag ghcr.io/pagecat/vowifi-engine:latest vowifi/engine
+sudo ./install.sh install
+```
+
+The images are labelled with the repository they were built from (`org.opencontainers.image.source`), which links each package to it and gives it the repository's visibility — a public fork publishes public images with no further setup. If a package still shows as private, change it under Packages → package → Package settings → Change visibility.
+
+---
+
 ## Static mode
 
 Static mode is for hosting where the control plane has no Docker socket — Kubernetes, Compose, or containers you run by hand. The control plane keeps everything it does (provisioning, WebUI, SMS, logs, eSIM, retries, stop-on-card-removal) except creating and removing engine containers: **you start one engine container per line** and keep it running. Start/stop/re-provision from the dashboard still work — they go through files in the line's instance directory, which the engine container mounts.
 
-**Control plane:** the `vowifi/control` image (or `python control/run.py` on a host) with
+**Control plane:** the `ghcr.io/<owner>/vowifi-control` image (see [Pre-built images](#pre-built-images); `vowifi/control` when built locally, or `python control/run.py` on a host) with
 
 - `VOWIFI_ENGINE_BACKEND=static`
 - the data directory mounted at `/data` (`VOWIFI_DATA=/data`) — shared with every engine container
@@ -216,7 +243,7 @@ docker run -d --name vowifi-engine-1 --restart unless-stopped \
   -v /run/pcscd:/run/pcscd \
   --cap-add NET_ADMIN --device /dev/net/tun \
   -p 5060:5060/udp -p 5061:5061 -p 8089:8089 -p 10000-10059:10000-10059/udp \
-  vowifi/engine
+  ghcr.io/pagecat/vowifi-engine:latest
 ```
 
 - This is the same container the control plane would create in Docker mode: `supervisor.py` is PID 1, waits for the control plane's start request, runs the engine session, and restarts or ends it on request — the container itself never exits. Start it before or after provisioning the line; until the line is provisioned it just idles.

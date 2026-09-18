@@ -1,0 +1,190 @@
+# Builds the engine and control images for linux/amd64 and linux/arm64 and publishes them as
+# ghcr.io/<repository owner>/vowifi-engine and ghcr.io/<repository owner>/vowifi-control. The
+# owner comes from the repository the workflow runs in, so the upstream repository and every
+# fork publish under their own names without editing this file.
+#
+# Each architecture is built natively on its own runner (no QEMU: the Asterisk compile would
+# take hours emulated) and pushed by digest; the publish job then combines the digests into
+# one multi-platform tag per image. Layer caches live in the registry next to the images
+# (<image>:cache-<arch>), where public packages are free and unbounded, instead of the 10 GB
+# GitHub Actions cache.
+#
+# Triggers: pull requests build only (no registry write); pushes to branches and v* tags
+# publish; the weekly run rebuilds the default branch without cache so `dnf update` and the
+# other base layers pick up security updates; workflow_dispatch does the same on demand.
+#
+# The org.opencontainers.image.source label links each package to the repository, so the
+# packages take its visibility (public repository -> public images).
+name: images
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - engine/**
+      - control/**
+      - webui/**
+      - install.sh
+      - .github/workflows/images.yml
+  pull_request:
+    paths:
+      - engine/**
+      - control/**
+      - webui/**
+      - install.sh
+      - .github/workflows/images.yml
+  schedule:
+    # Mondays 04:23 UTC. Off the top of the hour, where scheduled runs queue up and get delayed.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# A newer push to the same branch supersedes a build still in progress.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.image }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [engine, control]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: engine
+            context: engine
+            file: engine/Dockerfile
+          - image: control
+            context: .
+            file: control/Dockerfile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve image name and build parameters
+        id: params
+        run: |
+          # Registry names must be lowercase; repository owners need not be.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vowifi-${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+          echo "arch=${PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
+          # pcsc-lite must match the host pcscd exactly, so the images take the version the
+          # installer pins for the host rather than carrying a second copy of the number.
+          pcsc_version=$(sed -n 's/^PCSC_VERSION="\${PCSC_VERSION:-\(.*\)}"$/\1/p' install.sh)
+          [ -n "$pcsc_version" ] || { echo "PCSC_VERSION not found in install.sh" >&2; exit 1; }
+          echo "pcsc_version=$pcsc_version" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.params.outputs.image }}
+          labels: |
+            vowifi.pcsc_version=${{ steps.params.outputs.pcsc_version }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push by digest)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          build-args: PCSC_VERSION=${{ steps.params.outputs.pcsc_version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.params.outputs.image }}
+          outputs: ${{ env.PUBLISH == 'true' && 'type=image,push-by-digest=true,name-canonical=true,push=true' || '' }}
+          cache-from: type=registry,ref=${{ steps.params.outputs.image }}:cache-${{ steps.params.outputs.arch }}
+          cache-to: ${{ env.PUBLISH == 'true' && format('type=registry,ref={0}:cache-{1},mode=max', steps.params.outputs.image, steps.params.outputs.arch) || '' }}
+          no-cache: ${{ github.event_name == 'schedule' }}
+
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.image }}-${{ steps.params.outputs.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish ${{ matrix.image }}
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: [engine, control]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Resolve image name
+        id: params
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vowifi-${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.params.outputs.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Create the multi-platform manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
+        env:
+          IMAGE: ${{ steps.params.outputs.image }}
